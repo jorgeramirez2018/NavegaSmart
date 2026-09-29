@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NavegaSmart - EC2 (Docker Compose con PostgreSQL, backend y frontend) detrás de CloudFront (HTTPS).
+  El puerto 80 de la instancia solo acepta tráfico de CloudFront; no se abre SSH (acceso por SSM Session Manager).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: t3.micro entra en el free tier; t3.small si se necesita más memoria.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subred pública (la subred por defecto de una zona de la VPC por defecto).
+  CloudFrontPrefixListId:
+    Type: String
+    Description: Lista de prefijos administrada com.amazonaws.global.cloudfront.origin-facing de la región.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore        # despliegues y consola por SSM
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly  # descargar imágenes de ECR
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NavegaSmart - HTTP solo desde CloudFront
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      Tags:
+        - { Key: Name, Value: navegasmart-web }
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref WebSecurityGroup]
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags:
+        - { Key: Name, Value: navegasmart }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # Prepara la instancia: swap, Docker, Docker Compose y secretos. Los contenedores los arranca deploy.sh.
+          set -euxo pipefail
+
+          # 2 GB de swap: la t3.micro solo tiene 1 GB de RAM.
+          if [ ! -f /swapfile ]; then
+            dd if=/dev/zero of=/swapfile bs=1M count=2048
+            chmod 600 /swapfile
+            mkswap /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          fi
+          swapon -a
+
+          dnf install -y docker
+          systemctl enable --now docker
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+          # Secretos generados en la propia instancia: nunca salen de ella.
+          mkdir -p /opt/navegasmart
+          if [ ! -f /opt/navegasmart/.env ]; then
+            umask 077
+            {
+              echo "DB_PASSWORD=$(openssl rand -hex 24)"
+              echo "JWT_SECRET=$(openssl rand -hex 32)"
+            } > /opt/navegasmart/.env
+          fi
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - { Key: Name, Value: navegasmart }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: NavegaSmart
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_All
+        DefaultRootObject: index.html
+        Origins:
+          - Id: ec2
+            # Nombre DNS público de la IP elástica (CloudFront no acepta direcciones IP como origen).
+            DomainName: !Sub
+              - ec2-${Dashed}.compute-1.amazonaws.com
+              - Dashed: !Join ['-', !Split ['.', !Ref ElasticIp]]
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+        # Frontend estático: caché según las cabeceras que envía nginx.
+        DefaultCacheBehavior:
+          TargetOriginId: ec2
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+        CacheBehaviors:
+          # API: sin caché y reenviando todas las cabeceras (incluida Authorization).
+          - PathPattern: /api/*
+            TargetOriginId: ec2
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+              Headers: ['*']
+              Cookies: { Forward: all }
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+
+Outputs:
+  Url:
+    Description: Dirección pública de la aplicación
+    Value: !Sub https://${Distribution.DomainName}
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Value: !Ref ElasticIp
+  DistributionId:
+    Value: !Ref Distribution

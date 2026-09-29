@@ -1,0 +1,44 @@
+# Servicios en la instancia EC2. deploy.sh copia este archivo a /opt/navegasmart y lo ejecuta con:
+#   docker compose --env-file .env --env-file images.env up -d
+# .env (creado por la instancia en su primer arranque): DB_PASSWORD, JWT_SECRET
+# images.env (escrito en cada despliegue): BACKEND_IMAGE, FRONTEND_IMAGE
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: navegasmart
+      POSTGRES_USER: navegasmart
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD}
+    volumes:
+      - navegasmart-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U navegasmart -d navegasmart"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    image: ${BACKEND_IMAGE:?falta BACKEND_IMAGE}
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/navegasmart
+      DB_USER: navegasmart
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?falta JWT_SECRET}
+      # La instancia t3.micro tiene 1 GB de RAM compartido con PostgreSQL y nginx.
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Xmx400m -XX:+UseSerialGC}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?falta FRONTEND_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      - backend
+
+volumes:
+  navegasmart-data:

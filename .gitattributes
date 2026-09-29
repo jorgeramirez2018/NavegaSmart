@@ -1,0 +1,4 @@
+# Scripts que se ejecutan en bash o dentro de Linux: siempre con saltos de línea LF.
+*.sh text eol=lf
+Dockerfile text eol=lf
+nginx.conf text eol=lf
